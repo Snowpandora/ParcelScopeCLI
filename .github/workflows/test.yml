@@ -1,0 +1,20 @@
+name: CLI tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Test inspection and removal with synthetic data
+        run: swift test
+      - name: Build and verify the local universal installer
+        run: Scripts/package.sh local 0.1.0 "$RUNNER_TEMP/parcelscope"
