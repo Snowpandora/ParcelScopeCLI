@@ -4,6 +4,7 @@ set -euo pipefail
 usage() { printf 'Usage: %s local|release VERSION OUTPUT_DIRECTORY\n' "$0" >&2; exit 64; }
 [[ $# == 3 ]] || usage
 mode=$1 version=$2 output=$3
+signing_keychain=${PARCELSCOPE_SIGNING_KEYCHAIN:-}
 [[ $mode == local || $mode == release ]] || usage
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage
 if [[ $mode == release ]]; then
@@ -35,11 +36,13 @@ case "$architectures" in
     *) printf 'Expected arm64 and x86_64, found %s\n' "$architectures" >&2; exit 1 ;;
 esac
 if [[ $mode == release ]]; then
-    /usr/bin/codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID_APPLICATION" "$binary"
+    signing_args=(--force --options runtime --timestamp --sign "$DEVELOPER_ID_APPLICATION")
+    if [[ -n $signing_keychain ]]; then signing_args+=(--keychain "$signing_keychain"); fi
+    /usr/bin/codesign "${signing_args[@]}" "$binary"
 else
     /usr/bin/codesign --force --options runtime --sign - "$binary"
 fi
-/usr/bin/codesign --verify --strict "$binary"
+/usr/bin/codesign --verify --strict --all-architectures "$binary"
 /usr/bin/codesign --display --verbose=4 "$binary"
 name="ParcelScopeCLI-$version"
 if [[ $mode == local ]]; then name="$name-local"; fi
@@ -49,11 +52,25 @@ pkg="$stage/$name.pkg"
 /usr/bin/pkgbuild --root "$payload/private/etc/paths.d" --ownership recommended --install-location /private/etc/paths.d --identifier me.rbbtsn0w.parcelscope.cli.path --version "$version" "$stage/Path.pkg"
 /usr/bin/productbuild --synthesize --package "$stage/CLI.pkg" --package "$stage/Path.pkg" "$stage/Distribution.xml"
 args=(--distribution "$stage/Distribution.xml" --package-path "$stage")
-if [[ $mode == release ]]; then args+=(--sign "$DEVELOPER_ID_INSTALLER" --timestamp); fi
+if [[ $mode == release ]]; then
+    args+=(--sign "$DEVELOPER_ID_INSTALLER" --timestamp)
+    if [[ -n $signing_keychain ]]; then args+=(--keychain "$signing_keychain"); fi
+fi
 /usr/bin/productbuild "${args[@]}" "$pkg"
 if [[ $mode == release ]]; then
     /usr/sbin/pkgutil --check-signature "$pkg"
-    /usr/bin/xcrun notarytool submit "$pkg" --keychain-profile "$NOTARY_PROFILE" --wait
+    notary_args=(--keychain-profile "$NOTARY_PROFILE" --wait --timeout 15m --output-format json)
+    if [[ -n $signing_keychain ]]; then notary_args+=(--keychain "$signing_keychain"); fi
+    if ! notary_result=$(/usr/bin/xcrun notarytool submit "$pkg" "${notary_args[@]}"); then
+        printf '%s\n' "$notary_result" >&2
+        exit 1
+    fi
+    printf '%s\n' "$notary_result"
+    notary_status=$(/usr/bin/plutil -extract status raw -o - - <<< "$notary_result")
+    if [[ $notary_status != Accepted ]]; then
+        printf 'Apple notarization is not accepted: %s\n' "$notary_status" >&2
+        exit 1
+    fi
     /usr/bin/xcrun stapler staple "$pkg"
     /usr/bin/xcrun stapler validate "$pkg"
     /usr/sbin/spctl --assess --type install --verbose=2 "$pkg"

@@ -1,0 +1,106 @@
+name: Package CLI release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: CLI version from the selected main commit, for example 0.1.1
+        required: true
+        type: string
+      mode:
+        description: Sign and verify the installer, or also create a release draft
+        type: choice
+        default: verify
+        options:
+          - verify
+          - draft
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parcelscope-cli-release
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.repository == 'Snowpandora/ParcelScopeCLI' && github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate version and test the selected commit
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! $RELEASE_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Enter a version such as 0.1.1.' >&2
+            exit 64
+          fi
+          swift test
+          test "$(swift run parcelscope --version)" = "parcelscope $RELEASE_VERSION"
+
+  package:
+    needs: test
+    runs-on: macos-15
+    timeout-minutes: 30
+    environment: cli-release
+    permissions:
+      contents: write
+    env:
+      RELEASE_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check that the release version is unused
+        if: inputs.mode == 'draft'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name')
+          tag_refs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v$RELEASE_VERSION" --jq '.[].ref')
+          if grep -Fxq "v$RELEASE_VERSION" <<< "$release_tags" || grep -Fxq "refs/tags/v$RELEASE_VERSION" <<< "$tag_refs"; then
+            echo "A release or tag already exists for v$RELEASE_VERSION." >&2
+            exit 1
+          fi
+      - name: Sign, notarize and verify the installer
+        env:
+          DEVELOPER_ID_APPLICATION: ${{ vars.DEVELOPER_ID_APPLICATION }}
+          DEVELOPER_ID_INSTALLER: ${{ vars.DEVELOPER_ID_INSTALLER }}
+          DEVELOPER_ID_APPLICATION_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          DEVELOPER_ID_INSTALLER_P12_BASE64: ${{ secrets.DEVELOPER_ID_INSTALLER_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ vars.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ vars.NOTARY_ISSUER_ID }}
+        run: Scripts/package-in-actions.sh "$RELEASE_VERSION" "$RUNNER_TEMP/parcelscope-release"
+      - name: Verify the exact signed installer
+        env:
+          DEVELOPER_ID_APPLICATION: ${{ vars.DEVELOPER_ID_APPLICATION }}
+          DEVELOPER_ID_INSTALLER: ${{ vars.DEVELOPER_ID_INSTALLER }}
+        run: |
+          release_dir="$RUNNER_TEMP/parcelscope-release"
+          Scripts/verify-release-installer.sh "$RELEASE_VERSION" "$release_dir"
+          {
+            printf '### Signed ParcelScope CLI %s\n\n' "$RELEASE_VERSION"
+            printf 'Commit %s passed installer signature, stapled ticket, Gatekeeper and both executable slice checks.\n\n' "$GITHUB_SHA"
+            printf '%s\n' '```'
+            cat "$release_dir/ParcelScopeCLI-$RELEASE_VERSION.pkg.sha256"
+            printf '%s\n' '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Create a release draft with the verified installer
+        if: inputs.mode == 'draft'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP/parcelscope-release"
+          installer="ParcelScopeCLI-$RELEASE_VERSION.pkg"
+          shasum -a 256 -c "$installer.sha256"
+          gh release create "v$RELEASE_VERSION" "$installer" "$installer.sha256" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft \
+            --title "ParcelScope CLI $RELEASE_VERSION" --generate-notes

@@ -17,4 +17,6 @@ jobs:
       - name: Test inspection and removal with synthetic data
         run: swift test
       - name: Build and verify the local universal installer
-        run: Scripts/package.sh local 0.1.0 "$RUNNER_TEMP/parcelscope"
+        run: |
+          version=$(swift run parcelscope --version)
+          Scripts/package.sh local "${version#parcelscope }" "$RUNNER_TEMP/parcelscope"
