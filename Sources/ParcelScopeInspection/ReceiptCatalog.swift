@@ -66,11 +66,9 @@ public enum ReceiptReadError: LocalizedError, Sendable {
     public var errorDescription: String? {
         switch self {
         case .incomplete(let diagnostics):
-            if let duplicate = diagnostics.first(where: { $0.kind == .duplicateIdentifier }) {
-                duplicate.message
-            } else {
-                "Installed package access is limited. Allow access to the receipt folder, then refresh. No absence or cleanup result can be established from this data."
-            }
+            diagnostics.first(where: { $0.kind == .duplicateIdentifier })?.message
+                ?? diagnostics.first?.message
+                ?? "The installed package receipts could not be read completely."
         case .changedDuringRead:
             "Installed package records or their access changed during inspection. Refresh and review a new plan."
         case .invalidOutput(let command):

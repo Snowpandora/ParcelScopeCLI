@@ -55,13 +55,43 @@ public struct ReceiptStoreSnapshot: Sendable, Equatable {
         func diagnose(_ kind: ReceiptDiagnostic.Kind, _ path: String, _ message: String) {
             diagnostics.append(.init(kind: kind, resource: path, message: message))
         }
+        func diagnoseReadFailure(
+            _ error: Error, at path: String, message: String, fallback: ReceiptDiagnostic.Kind = .unreadableStore
+        ) {
+            if case .changedDuringRead? = error as? ReceiptReadError {
+                diagnose(.changedDuringRead, path, message)
+                return
+            }
+            let reportedError = error as NSError
+            // FileHandle can wrap a read failure with a misleading Cocoa error code.
+            let failure: NSError
+            if let underlying = reportedError.userInfo[NSUnderlyingErrorKey] as? NSError,
+               underlying.domain == NSPOSIXErrorDomain {
+                failure = underlying
+            } else {
+                failure = reportedError
+            }
+            switch (failure.domain, failure.code) {
+            case (NSPOSIXErrorDomain, Int(EACCES)), (NSPOSIXErrorDomain, Int(EPERM)),
+                 (NSCocoaErrorDomain, NSFileReadNoPermissionError):
+                diagnose(.accessDenied, path, message)
+            case (NSPOSIXErrorDomain, Int(ENOENT)),
+                 (NSCocoaErrorDomain, NSFileReadNoSuchFileError), (NSCocoaErrorDomain, NSFileNoSuchFileError):
+                diagnose(.changedDuringRead, path, message)
+            default:
+                diagnose(fallback, path, message)
+            }
+        }
+
         for path in paths {
             var metadata = stat()
             if lstat(path, &metadata) != 0 {
-                if errno == ENOENT {
+                let errorCode = errno
+                if errorCode == ENOENT {
                     fingerprints[path] = "absent"
                 } else {
-                    diagnose(.accessDenied, path, "The receipt store could not be inspected.")
+                    let error = POSIXError(POSIXErrorCode(rawValue: errorCode) ?? .EIO)
+                    diagnoseReadFailure(error, at: path, message: "The receipt store could not be inspected.")
                 }
                 continue
             }
@@ -79,7 +109,8 @@ public struct ReceiptStoreSnapshot: Sendable, Equatable {
                     let child = path + "/" + name
                     var item = stat()
                     guard lstat(child, &item) == 0 else {
-                        diagnose(.unreadableStore, child, "A receipt entry changed or could not be read.")
+                        let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                        diagnoseReadFailure(error, at: child, message: "A receipt entry changed or could not be read.")
                         continue
                     }
                     fingerprints[child] = fingerprint(item)
@@ -106,7 +137,9 @@ public struct ReceiptStoreSnapshot: Sendable, Equatable {
                             }
                             ids.insert(id)
                             idsByStem[(name as NSString).deletingPathExtension] = id
-                        } catch { diagnose(.unreadableStore, child, "Receipt metadata could not be read.") }
+                        } catch {
+                            diagnoseReadFailure(error, at: child, message: "Receipt metadata could not be read.")
+                        }
                     case "bom":
                         bomStems.insert((name as NSString).deletingPathExtension)
                         do {
@@ -129,7 +162,11 @@ public struct ReceiptStoreSnapshot: Sendable, Equatable {
                             guard fstat(handle.fileDescriptor, &opened) == 0, fingerprint(opened) == fingerprint(item) else { throw ReceiptReadError.changedDuringRead }
                             pathsByStem[(name as NSString).deletingPathExtension] = paths
                             validatedBOMs[child] = ValidatedBOM(fingerprint: fingerprint(item), paths: paths)
-                        } catch { diagnose(.invalidData, child, "The receipt file inventory could not be completely validated.") }
+                        } catch {
+                            diagnoseReadFailure(error, at: child,
+                                                message: "The receipt file inventory could not be completely validated.",
+                                                fallback: .invalidData)
+                        }
                     default:
                         diagnose(.unsupportedLayout, child, "The receipt layout contains an unrecognized entry.")
                     }
@@ -146,7 +183,9 @@ public struct ReceiptStoreSnapshot: Sendable, Equatable {
                         inventoryPaths[id] = paths
                     }
                 }
-            } catch { diagnose(.accessDenied, path, "The receipt directory could not be enumerated.") }
+            } catch {
+                diagnoseReadFailure(error, at: path, message: "The receipt directory could not be enumerated.")
+            }
         }
         var snapshot = Self(packageIDs: ids, fingerprints: fingerprints, diagnostics: diagnostics, fileInventoryPackageIDs: inventoryIDs, inventoryPaths: inventoryPaths)
         snapshot.validatedBOMs = validatedBOMs
